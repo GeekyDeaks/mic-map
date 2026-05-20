@@ -33,24 +33,27 @@ public:
     
     void update(float detectionConfidence, std::chrono::milliseconds deltaTime) override {
         timeInState_ += deltaTime;
-        
+
         switch (currentState_) {
             case State::Idle:
                 updateIdle(detectionConfidence);
                 break;
-                
+
             case State::Training:
                 // Training state is managed externally
                 break;
-                
+
             case State::Detecting:
                 updateDetecting(detectionConfidence);
                 break;
-                
+
             case State::Triggered:
-                updateTriggered();
+                // One-tick latch: Triggered lasts a single update so the
+                // callback observer has a chance to see the state. Next
+                // tick drops straight into Cooldown.
+                transitionTo(State::Cooldown);
                 break;
-                
+
             case State::Cooldown:
                 updateCooldown();
                 break;
@@ -126,24 +129,20 @@ private:
             transitionTo(State::Idle);
             return;
         }
-        
+
         if (timeInState_ >= config_.minDetectionDuration) {
-            // Detection held long enough - trigger!
+            // Detection held long enough -- fire a single tap event.
             transitionTo(State::Triggered);
-            
-            MICMAP_LOG_INFO("Trigger fired after ", timeInState_.count(), "ms");
-            
+
+            MICMAP_LOG_INFO("Tap fired after ", timeInState_.count(), "ms");
+
             if (triggerCallback_) {
                 triggerCallback_();
             }
         }
     }
-    
-    void updateTriggered() {
-        // Immediately transition to cooldown
-        transitionTo(State::Cooldown);
-    }
-    
+
+    // Cooldown (D-11): blocks next tap until duration elapses.
     void updateCooldown() {
         if (timeInState_ >= config_.cooldownDuration) {
             transitionTo(State::Idle);

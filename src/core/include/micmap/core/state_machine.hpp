@@ -15,20 +15,25 @@ namespace micmap::core {
  * @brief State machine configuration
  */
 struct StateMachineConfig {
-    std::chrono::milliseconds minDetectionDuration{500};  ///< Minimum detection time before trigger
-    std::chrono::milliseconds cooldownDuration{300};      ///< Cooldown after trigger
+    std::chrono::milliseconds minDetectionDuration{100};  ///< Min hold before rising-edge trigger fires
+    std::chrono::milliseconds cooldownDuration{500};      ///< Cooldown after trigger before next is allowed
     float detectionThreshold{0.7f};                       ///< Confidence threshold for detection
 };
 
 /**
- * @brief State machine states
+ * @brief State machine states.
+ *
+ * Triggered is a single rising-edge event (tap semantics); the machine returns
+ * to Cooldown immediately after the callback fires, then back to Idle once
+ * cooldownDuration elapses. There is no release edge -- the driver handles
+ * the full press+release internally as a single tap.
  */
 enum class State {
     Idle,       ///< Waiting for detection
     Training,   ///< Training mode active
     Detecting,  ///< Pattern detected, waiting for duration
-    Triggered,  ///< Trigger fired
-    Cooldown    ///< Cooldown period after trigger
+    Triggered,  ///< Tap just fired; next tick transitions to Cooldown
+    Cooldown    ///< Post-trigger cooldown
 };
 
 /**
@@ -46,7 +51,7 @@ inline const char* stateToString(State state) {
 }
 
 /**
- * @brief Callback for trigger events
+ * @brief Callback for trigger events. Fires once per rising-edge tap.
  */
 using TriggerCallback = std::function<void()>;
 

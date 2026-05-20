@@ -30,10 +30,16 @@
 #include "micmap/audio/audio_capture.hpp"
 #include "micmap/detection/noise_detector.hpp"
 #include "micmap/steamvr/vr_input.hpp"
-#include "micmap/steamvr/dashboard_manager.hpp"
 #include "micmap/core/state_machine.hpp"
 #include "micmap/core/config_manager.hpp"
 #include "micmap/common/logger.hpp"
+#include "micmap/common/cli_flags.hpp"
+#include "micmap/steamvr/manifest_registrar.hpp"
+#include "micmap/bindings/bindings_patcher.hpp"
+#include "first_launch_balloon.hpp"
+#ifdef MICMAP_HAS_OPENVR
+#include <openvr.h>
+#endif
 
 #include <memory>
 #include <atomic>
@@ -42,6 +48,7 @@
 #include <mutex>
 #include <thread>
 #include <future>
+#include <filesystem>
 
 using namespace micmap;
 
@@ -59,14 +66,13 @@ struct MicMapApp {
     std::unique_ptr<audio::IAudioCapture> audioCapture;
     std::unique_ptr<detection::INoiseDetector> detector;
     std::unique_ptr<steamvr::IVRInput> vrInput;
-    std::unique_ptr<steamvr::IDashboardManager> dashboardManager;
     std::unique_ptr<core::IStateMachine> stateMachine;
     std::unique_ptr<core::IConfigManager> configManager;
     std::unique_ptr<steamvr::IDriverClient> driverClient;
-    
+
     std::vector<audio::AudioDevice> devices;
     int selectedDeviceIndex = 0;
-    
+
     std::atomic<bool> running{true};
     std::atomic<float> currentLevel{0.0f};
     std::atomic<float> currentLevelDb{-60.0f};
@@ -78,26 +84,52 @@ struct MicMapApp {
     std::atomic<bool> isTraining{false};
     std::atomic<int> trainingSampleCount{0};
     std::atomic<bool> hasProfile{false};
-    
+
     // Button fire tracking (matching mic_test)
     std::chrono::steady_clock::time_point detectionStartTime;
     std::atomic<bool> detectionActive{false};
     std::atomic<bool> buttonWouldFire{false};
     std::atomic<int> detectionDurationMs{0};
-    
+
     // Cooldown tracking to prevent repeated triggers
     std::chrono::steady_clock::time_point lastTriggerTime;
     std::atomic<bool> inCooldown{false};
-    
+
     std::chrono::steady_clock::time_point lastUpdate;
-    
+
     int detectionTimeMs = 300;
-    
+
     HWND hwnd = nullptr;
     NOTIFYICONDATAW nid = {};
     bool minimizedToTray = false;
     std::mutex audioMutex;
-    
+
+    // Phase 3 Plan 07: fire-and-forget re-registration thread (D-15 amended,
+    // Pitfall 6). MUST be std::thread + atomic stop — std::async's future
+    // destructor blocks in its dtor, which would defeat fire-and-forget.
+    std::unique_ptr<steamvr::IManifestRegistrar> manifestRegistrar;
+    std::thread                                   manifestRetryThread;
+    std::atomic<bool>                             manifestRetryCancel{false};
+
+    // WR-01: initial first-boot async init thread. Previously detached, which
+    // left no way for shutdown() to wait on in-flight driverClient->connect()
+    // / vrInput->initialize() calls before step 3 (disconnect) destroyed the
+    // objects they were touching. Tracked and joined in shutdown() like the
+    // manifest retry thread.
+    std::thread                                   initialConnectThread;
+    std::atomic<bool>                             initialConnectCancel{false};
+
+    // WR-05: reconnect futures tracked on the app so shutdown() can wait on
+    // them BEFORE tearing down driverClient / vrInput. Previously these were
+    // function-local `static std::future<void>` in WinMain's message loop,
+    // which meant shutdown() destroyed driverClient while an in-flight
+    // connect() / initialize() was still touching it. Unlike the retry
+    // thread, these use std::async — their destructors block anyway — but
+    // waiting explicitly before teardown avoids operating on half-destroyed
+    // state.
+    std::future<void> driverConnectFuture;
+    std::future<void> vrInitFuture;
+
     bool initialize();
     void shutdown();
     void onTrigger();
@@ -126,10 +158,10 @@ bool CreateDeviceD3D(HWND hWnd) {
 
     D3D_FEATURE_LEVEL featureLevel;
     const D3D_FEATURE_LEVEL levels[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
-    HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, 
+    HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
         levels, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
     if (res == DXGI_ERROR_UNSUPPORTED)
-        res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, 
+        res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
             levels, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
     if (res != S_OK) return false;
     CreateRenderTarget();
@@ -144,10 +176,23 @@ void CleanupDeviceD3D() {
 }
 
 void CreateRenderTarget() {
-    ID3D11Texture2D* pBackBuffer;
-    g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
-    g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+    // IN-13 iter-3: check HRESULTs. GetBuffer failure leaves pBackBuffer
+    // uninitialized (UB on subsequent deref/Release); CreateRenderTargetView
+    // failure leaves g_mainRenderTargetView null, which the render loop
+    // then binds via OMSetRenderTargets -> crash on ClearRenderTargetView.
+    ID3D11Texture2D* pBackBuffer = nullptr;
+    HRESULT hr = g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+    if (FAILED(hr) || !pBackBuffer) {
+        MICMAP_LOG_ERROR("GetBuffer failed: hr=0x", std::hex, hr);
+        g_mainRenderTargetView = nullptr;
+        return;
+    }
+    hr = g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
     pBackBuffer->Release();
+    if (FAILED(hr)) {
+        MICMAP_LOG_ERROR("CreateRenderTargetView failed: hr=0x", std::hex, hr);
+        g_mainRenderTargetView = nullptr;
+    }
 }
 
 void CleanupRenderTarget() {
@@ -162,23 +207,28 @@ void SetupSystemTray(HWND hwnd) {
     g_app.nid.uCallbackMessage = WM_TRAYICON;
     g_app.nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     wcscpy_s(g_app.nid.szTip, L"MicMap");
-    Shell_NotifyIconW(NIM_ADD, &g_app.nid);
+    // IN-03: Shell_NotifyIconW can return FALSE if the shell is not ready
+    // (per-user context still loading at auto-launch) or taskbar is unhappy.
+    // Log the failure so the absent-tray + never-fired-balloon case is
+    // visible in the log instead of silently misattributed.
+    if (!Shell_NotifyIconW(NIM_ADD, &g_app.nid)) {
+        MICMAP_LOG_WARNING("Shell_NotifyIconW(NIM_ADD) failed; tray icon may be missing (GetLastError=",
+                           GetLastError(), ")");
+    }
 }
-
-void RemoveSystemTray() { Shell_NotifyIconW(NIM_DELETE, &g_app.nid); }
 
 bool MicMapApp::initialize() {
     configManager = core::createConfigManager();
     configManager->loadDefault();
     auto& config = configManager->getConfig();
     detectionTimeMs = config.detection.minDurationMs;
-    
+
     audioCapture = audio::createWASAPICapture();
     if (!audioCapture) return false;
-    
+
     devices = audioCapture->enumerateDevices();
     bool deviceSelected = false;
-    
+
     // First try to find a device with "Beyond" in the name
     for (size_t i = 0; i < devices.size(); ++i) {
         if (devices[i].name.find(L"Beyond") != std::wstring::npos) {
@@ -189,7 +239,7 @@ bool MicMapApp::initialize() {
             }
         }
     }
-    
+
     // If no Beyond device, try saved device ID
     if (!deviceSelected && !config.audio.deviceId.empty()) {
         deviceSelected = audioCapture->selectDeviceById(config.audio.deviceId);
@@ -200,24 +250,26 @@ bool MicMapApp::initialize() {
             }
         }
     }
-    
+
     // Fall back to first device
     if (!deviceSelected && !devices.empty()) {
         deviceSelected = audioCapture->selectDeviceById(devices[0].id);
         selectedDeviceIndex = 0;
     }
-    
+
     auto device = audioCapture->getCurrentDevice();
     if (device.sampleRate > 0) {
         detector = detection::createFFTDetector(device.sampleRate, config.detection.fftSize);
         detector->setMinDetectionDuration(config.detection.minDurationMs);
         detector->loadTrainingData(configManager->getTrainingDataPath());
     }
-    
+
     // Initialize driver client (non-blocking - will connect in background)
     driverClient = steamvr::createDriverClient();
-    
-    // Initialize VR input (don't initialize yet - will do async)
+
+    // Initialize VR input (don't initialize yet - will do async).
+    // VR input is only used for SteamVR-quit lifecycle notifications now;
+    // all button presses flow through driverClient (POST /button).
     vrInput = steamvr::createOpenVRInput();
     vrInput->setEventCallback([this](const steamvr::VREvent& event) {
         if (event.type == steamvr::VREventType::Quit) {
@@ -225,38 +277,92 @@ bool MicMapApp::initialize() {
             PostMessage(hwnd, WM_STEAMVR_QUIT, 0, 0);
         }
     });
-    
-    // Initialize dashboard manager (without VR connection initially)
-    dashboardManager = steamvr::createDashboardManager();
-    steamvr::DashboardManagerConfig dashConfig;
-    dashConfig.autoReconnect = true;
-    dashConfig.exitWithSteamVR = false; // Don't exit if SteamVR closes
-    // Don't initialize dashboard manager with VR yet - will be done when VR connects
-    
+
+    // Phase 3 Plan 07 / D-15 amended (Pitfall 6): fire-and-forget manifest
+    // re-registration on every GUI boot. Self-heals across SteamVR upgrades
+    // and user-initiated manifest removal (AUTO-04). MUST use std::thread
+    // with std::atomic<bool> cancel — std::async's future destructor would
+    // block in its dtor and defeat fire-and-forget semantics (Pitfall 6).
+    manifestRegistrar = steamvr::createManifestRegistrar();
+    manifestRetryThread = std::thread([this]() {
+#ifdef MICMAP_HAS_OPENVR
+        // Fix (Phase 4 UAT): the sidecar owns a single in-process VR session
+        // via vrInput (VRApplication_Background). vr::VRApplications() is a
+        // process-global accessor, so manifestRegistrar->ensureRegistered() can
+        // operate against that existing session without its own VR_Init. Calling
+        // VR_Init a second time here while the Background session was still
+        // active caused OpenVR to log
+        //   "VR_Init a second time without an intervening VR_Shutdown"
+        // and the process SEGV'd ~150ms into startup (see
+        // .planning/debug/micmap-startup-segv.md).
+        //
+        // Teardown ordering is unchanged: the cancel+join at shutdown() step 0
+        // (D-14) pre-empts any in-flight ensureRegistered call. The offline
+        // case (SteamVR not running at startup) is handled by the main-loop
+        // reconnect branch which retries vrInput->initialize(); this thread's
+        // poll will observe isInitialized() == true whenever that happens.
+        while (!manifestRetryCancel.load()) {
+            // Wait up to 3s for vrInput to finish its VR_Init(Background).
+            // Cancel-responsive on 100ms ticks.
+            bool ready = false;
+            for (int i = 0; i < 30 && !manifestRetryCancel.load(); ++i) {
+                if (vrInput && vrInput->isInitialized()) { ready = true; break; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (manifestRetryCancel.load()) break;
+            if (ready) {
+                const auto r = manifestRegistrar->ensureRegistered();
+                if (r == steamvr::RegisterResult::Success) {
+                    // D-18: state-change-only logging. ensureRegistered already
+                    // logs INFO on not-installed -> installed transition; no-op
+                    // when already installed. Thread exits after success.
+                    return;
+                }
+                // ensureRegistered logs its own WARNINGs on failure paths;
+                // do not spam here (D-16 / D-18).
+            }
+            // D-16: SteamVR not running (or registrar failure): silent retry.
+            // 30s sleep in 1s cancel-responsive ticks so shutdown is prompt.
+            for (int i = 0; i < 30 && !manifestRetryCancel.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        }
+#endif
+    });
+
+    // State machine acts as a pure edge-latch + cooldown over the
+    // detector's already temporally-gated DetectionResult::isWhiteNoise
+    // boolean. The detector owns the "sustain for minDurationMs" logic
+    // (via detector->setMinDetectionDuration); the state machine only
+    // adds cooldown and a triggerCallback edge. Do NOT apply
+    // minDetectionDuration on both sides -- that double-gates the
+    // trigger path and also makes the state machine's threshold check
+    // depend on the noisy instantaneous `confidence` value instead of
+    // the stable `isWhiteNoise` flag that drives the rest of the UI.
     core::StateMachineConfig smConfig;
-    smConfig.minDetectionDuration = std::chrono::milliseconds(config.detection.minDurationMs);
+    smConfig.minDetectionDuration = std::chrono::milliseconds(0);
     smConfig.cooldownDuration = std::chrono::milliseconds(config.detection.cooldownMs);
-    smConfig.detectionThreshold = config.detection.sensitivity;
+    smConfig.detectionThreshold = 0.5f;  // any boolean-true (1.0) crosses; boolean-false (0.0) does not
     stateMachine = core::createStateMachine(smConfig);
     stateMachine->setTriggerCallback([this]() { onTrigger(); });
-    
+
     // Check if we have a profile loaded
     hasProfile = detector && detector->hasTrainingData();
-    
+
     if (audioCapture && detector) {
         audioCapture->setAudioCallback([this](const float* samples, size_t count) {
             std::lock_guard<std::mutex> lock(audioMutex);
-            
+
             // Calculate RMS level (matching mic_test)
             float rms = 0.0f;
             for (size_t i = 0; i < count; ++i) rms += samples[i] * samples[i];
             rms = std::sqrt(rms / count);
-            
+
             // Scale for display (0-1 range)
             float scaledLevel = rms * 10.0f;
             currentLevel = (scaledLevel > 1.0f) ? 1.0f : scaledLevel;
             currentLevelDb = (rms <= 0.0f) ? -60.0f : std::max(-60.0f, 20.0f * std::log10(rms));
-            
+
             // Training or detection (only detect if we have a profile) - matching mic_test
             if (isTraining) {
                 detector->addTrainingSample(samples, count);
@@ -269,28 +375,30 @@ bool MicMapApp::initialize() {
                 currentEnergy = result.energy;
                 currentEnergyDb = (result.energy <= 0.0f) ? -60.0f : std::max(-60.0f, 20.0f * std::log10(result.energy));
                 isDetected = result.isWhiteNoise;
-                
+
                 // Track detection duration for button fire (matching mic_test)
                 if (result.isWhiteNoise) {
                     if (!detectionActive) {
                         detectionStartTime = std::chrono::steady_clock::now();
                         detectionActive = true;
                     }
-                    
+
                     auto now = std::chrono::steady_clock::now();
                     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                         now - detectionStartTime).count();
                     detectionDurationMs = static_cast<int>(duration);
-                    
+
                     // Check cooldown
                     auto cooldownElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                         now - lastTriggerTime).count();
                     bool cooldownExpired = cooldownElapsed >= 300; // 300ms cooldown
-                    
+
                     if (duration >= detectionTimeMs && !buttonWouldFire && cooldownExpired && !inCooldown) {
                         buttonWouldFire = true;
-                        // Trigger the action!
-                        onTrigger();
+                        // Note: actual tap dispatch flows through the state
+                        // machine -> setTriggerCallback -> onTrigger(). This
+                        // branch only updates the legacy "buttonWouldFire"
+                        // UI hint + cooldown flag.
                         lastTriggerTime = now;
                         inCooldown = true;
                     }
@@ -300,12 +408,26 @@ bool MicMapApp::initialize() {
                     detectionDurationMs = 0;
                     inCooldown = false; // Reset cooldown when detection stops
                 }
-                
-                // Update state machine
+
+                // Update state machine.
+                //
+                // Drive the state machine from the detector's temporally-gated
+                // boolean `result.isWhiteNoise` (encoded as 1.0/0.0), NOT the
+                // instantaneous `result.confidence`. The raw confidence score
+                // dips below any reasonable threshold between audio callbacks
+                // even while a cover is sustained, which would cause
+                // IStateMachine::updateDetecting() to bounce back to Idle
+                // before minDetectionDuration elapses -- i.e. the tap would
+                // never fire. `isWhiteNoise` already incorporates the
+                // spike-gate + temporal smoothing that the rest of the UI
+                // trusts.
                 auto now = std::chrono::steady_clock::now();
                 auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUpdate);
                 lastUpdate = now;
-                if (stateMachine) stateMachine->update(result.confidence, delta);
+                if (stateMachine) {
+                    float smInput = result.isWhiteNoise ? 1.0f : 0.0f;
+                    stateMachine->update(smInput, delta);
+                }
             } else {
                 // No profile - reset detection state
                 currentConfidence = 0.0f;
@@ -317,7 +439,7 @@ bool MicMapApp::initialize() {
                 buttonWouldFire = false;
                 detectionDurationMs = 0;
             }
-            
+
             hasProfile = detector->hasTrainingData();
         });
         audioCapture->startCapture();
@@ -327,54 +449,76 @@ bool MicMapApp::initialize() {
 }
 
 void MicMapApp::shutdown() {
+    // Phase 3 Plan 07 / D-12 / D-14: idempotent ordered teardown. Called from
+    // the main-loop exit path in WinMain after `running=false` breaks the
+    // message pump; may also be reached via fatal-error paths. Guard
+    // re-entry so a second invocation is a no-op (all exit paths converge).
+    static std::atomic<bool> alreadyShutdown{false};
+    if (alreadyShutdown.exchange(true)) return;
+
     running = false;
+
+    // 0. Stop retry thread FIRST — before vrInput->shutdown — so no retry
+    //    attempt is mid-VR_Init while vrInput::shutdown is calling VR_Shutdown
+    //    (T-03-07-02 mitigation). Cancel is atomic; join blocks up to 1s
+    //    worst-case thanks to the 1s-tick cancel-responsive sleep loop.
+    manifestRetryCancel.store(true);
+    if (manifestRetryThread.joinable()) manifestRetryThread.join();
+
+    // WR-01: signal cancel + join the first-boot async init thread BEFORE
+    // step 3 (driverClient->disconnect) / step 4 (vrInput->shutdown) tear
+    // down the objects it's calling into. Previously this thread was
+    // detached, leaving no join handle and a latent race on fast-quit.
+    initialConnectCancel.store(true);
+    if (initialConnectThread.joinable()) initialConnectThread.join();
+
+    // WR-05: wait for any in-flight reconnect futures (driverClient->connect
+    // and vrInput->initialize launched via std::async from the main loop)
+    // BEFORE the teardown below touches those objects. Without this wait,
+    // shutdown() could call driverClient->disconnect() / vrInput->shutdown()
+    // while the background connect/initialize is still reading those members.
+    // std::async's future destructor blocks anyway; waiting explicitly here
+    // makes the ordering intent readable and prevents touching half-destroyed
+    // state if the wait were deferred to future dtors after teardown.
+    if (driverConnectFuture.valid()) driverConnectFuture.wait();
+    if (vrInitFuture.valid())         vrInitFuture.wait();
+
+    // D-12 ordered teardown (reverse-init):
+    // 1. Stop audio capture
     if (audioCapture) audioCapture->stopCapture();
+    // 2. Persist detector training (pre-reset) + reset detector
     if (detector && detector->hasTrainingData() && configManager)
         detector->saveTrainingData(configManager->getTrainingDataPath());
-    if (dashboardManager) dashboardManager->shutdown();
-    if (vrInput) vrInput->shutdown();
+    if (detector) detector.reset();
+    // 3. Disconnect driver client
     if (driverClient) driverClient->disconnect();
+    // 4. Shutdown VR input (calls VR_Shutdown under MICMAP_HAS_OPENVR)
+    if (vrInput) vrInput->shutdown();
+    // 5. Persist config (shownTrayNotification flag + any UI-edited fields)
     if (configManager) configManager->saveDefault();
-    RemoveSystemTray();
+    // 6. Remove tray icon
+    // IN-12 iter-3: symmetric WARNING log with IN-03 NIM_ADD path so a
+    // "stuck zombie tray icon after MicMap quit" is diagnosable from the log.
+    if (nid.cbSize != 0) {
+        if (!Shell_NotifyIconW(NIM_DELETE, &nid)) {
+            MICMAP_LOG_WARNING("Shell_NotifyIconW(NIM_DELETE) failed; tray icon "
+                               "may persist until explorer restart (GetLastError=",
+                               GetLastError(), ")");
+        }
+        nid.cbSize = 0;  // mark removed so re-entry into shutdown is a no-op
+    }
+    // Steps 7-8 (ImGui shutdown, D3D/window cleanup, UnregisterClassW) are
+    // handled by WinMain's tail after shutdown() returns — preserves the
+    // existing call-site topology.
 }
 
 void MicMapApp::onTrigger() {
-    // Use dashboardManager->performDashboardAction() like hmd_button_test's Auto button
-    // This handles both opening dashboard (when closed) and sending click (when open)
-    
-    if (dashboardManager && dashboardManager->isConnected()) {
-        // Use the dashboard manager's performDashboardAction which handles both cases
-        dashboardManager->performDashboardAction();
+    if (!driverClient || !driverClient->isConnected()) {
+        MICMAP_LOG_DEBUG("onTrigger: driver not connected, skipping");
         return;
     }
-    
-    // Fallback: try using driver client directly
-    if (driverClient && driverClient->isConnected()) {
-        auto state = steamvr::DashboardState::Unknown;
-        if (vrInput && vrInput->isInitialized()) {
-            state = vrInput->getDashboardState();
-        } else if (dashboardManager) {
-            state = dashboardManager->getDashboardState();
-        }
-        
-        if (state == steamvr::DashboardState::Closed || state == steamvr::DashboardState::Unknown) {
-            // Open dashboard - send system button to toggle dashboard
-            driverClient->click("system", 100);
-        } else if (state == steamvr::DashboardState::Open) {
-            // Send click to select item under pointer
-            driverClient->click("trigger", 100);
-        }
-        return;
-    }
-    
-    // Last resort: try VR input directly
-    if (vrInput && vrInput->isInitialized()) {
-        auto state = vrInput->getDashboardState();
-        if (state == steamvr::DashboardState::Closed || state == steamvr::DashboardState::Unknown) {
-            vrInput->sendHMDButtonEvent();
-        } else if (state == steamvr::DashboardState::Open) {
-            vrInput->sendDashboardSelect();
-        }
+    if (!driverClient->tap()) {
+        MICMAP_LOG_WARNING("onTrigger failed: ", driverClient->getLastError());
     }
 }
 
@@ -382,29 +526,34 @@ void MicMapApp::renderUI() {
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
     ImGui::Begin("MicMap", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
-    
+
     ImGui::Text("Status");
     ImGui::Separator();
     bool vrOk = vrInput && vrInput->isInitialized();
     ImGui::TextColored(vrOk ? ImVec4(0,1,0,1) : ImVec4(1,0.5f,0,1), "SteamVR: %s", vrOk ? "Connected" : "Not Connected");
     bool drvOk = driverClient && driverClient->isConnected();
     ImGui::TextColored(drvOk ? ImVec4(0,1,0,1) : ImVec4(1,0.5f,0,1), "Driver: %s", drvOk ? "Connected" : "Not Connected");
-    if (dashboardManager) {
-        auto ds = dashboardManager->getDashboardState();
-        ImGui::Text("Dashboard: %s", ds == steamvr::DashboardState::Open ? "Open" : ds == steamvr::DashboardState::Closed ? "Closed" : "Unknown");
-    }
-    
+
     ImGui::Spacing();
     ImGui::Text("Audio Device");
     ImGui::Separator();
     if (!devices.empty()) {
         std::vector<std::string> names;
         for (auto& d : devices) {
-            // Convert wstring to string properly
-            std::string name(d.name.length(), '\0');
-            WideCharToMultiByte(CP_UTF8, 0, d.name.c_str(), -1, &name[0], (int)name.size() + 1, nullptr, nullptr);
-            name.resize(strlen(name.c_str()));
-            names.push_back(name);
+            // WR-05: size the UTF-8 buffer via a probing call first. The
+            // original code allocated one byte per wide-char code unit, which
+            // underflows for non-ASCII names (UTF-8 needs up to 3 bytes per
+            // BMP code unit, 4 for non-BMP pairs). First call returns the
+            // required byte count including the NUL terminator.
+            std::string name;
+            int needed = WideCharToMultiByte(CP_UTF8, 0, d.name.c_str(), -1,
+                                             nullptr, 0, nullptr, nullptr);
+            if (needed > 0) {
+                name.resize(static_cast<size_t>(needed - 1));  // drop NUL
+                WideCharToMultiByte(CP_UTF8, 0, d.name.c_str(), -1,
+                                    name.data(), needed, nullptr, nullptr);
+            }
+            names.push_back(std::move(name));
         }
         std::vector<const char*> ptrs;
         for (auto& n : names) ptrs.push_back(n.c_str());
@@ -415,47 +564,87 @@ void MicMapApp::renderUI() {
             audioCapture->selectDeviceById(devices[selectedDeviceIndex].id);
             auto dev = audioCapture->getCurrentDevice();
             if (dev.sampleRate > 0) {
-                detector = detection::createFFTDetector(dev.sampleRate);
-                detector->setMinDetectionDuration(detectionTimeMs);
-                if (configManager) detector->loadTrainingData(configManager->getTrainingDataPath());
+                // WR-03: guard detector reassignment under audioMutex so the
+                // WASAPI callback (which takes the same mutex before
+                // dereferencing `detector`) cannot race with the swap and
+                // have the old detector destroyed out from under it.
+                {
+                    std::lock_guard<std::mutex> lock(audioMutex);
+                    detector = detection::createFFTDetector(dev.sampleRate);
+                    detector->setMinDetectionDuration(detectionTimeMs);
+                    if (configManager) detector->loadTrainingData(configManager->getTrainingDataPath());
+                }
+                // WR-04: only restart capture after the detector has been
+                // rebuilt for the new device's sample rate. If sampleRate == 0
+                // the rebuild is skipped, so the previous detector (configured
+                // for a different rate) would otherwise produce bogus
+                // confidence values against the new stream.
+                audioCapture->startCapture();
+            } else {
+                MICMAP_LOG_WARNING("Device switch: new device reported sampleRate=0; capture NOT restarted");
             }
-            audioCapture->startCapture();
             if (configManager) configManager->getConfig().audio.deviceId = devices[selectedDeviceIndex].id;
         }
     }
-    
+
     ImGui::Spacing();
     ImGui::Text("Settings");
     ImGui::Separator();
     ImGui::Text("Detection Time: %d ms", detectionTimeMs);
     ImGui::SetNextItemWidth(-1);
     if (ImGui::SliderInt("##Time", &detectionTimeMs, 100, 1000, "")) {
-        if (detector) detector->setMinDetectionDuration(detectionTimeMs);
+        // WR-07: mirror WR-03 — guard detector state mutations under
+        // audioMutex so the WASAPI callback (which locks audioMutex before
+        // calling detector->analyze/addTrainingSample) cannot race with a
+        // UI-thread setMinDetectionDuration writing the detector's
+        // duration-threshold field.
+        if (detector) {
+            std::lock_guard<std::mutex> lock(audioMutex);
+            detector->setMinDetectionDuration(detectionTimeMs);
+        }
         if (configManager) configManager->getConfig().detection.minDurationMs = detectionTimeMs;
     }
-    
+
     ImGui::Spacing();
     ImGui::Text("Training");
     ImGui::Separator();
-    
+
     // Check for auto-stop training (matching mic_test)
+    // WR-07: finishTraining + saveTrainingData mutate detector internals
+    // (FFT pattern buffers, training-sample accumulators) that the audio
+    // callback reads via addTrainingSample / analyze under audioMutex. Mirror
+    // the WR-03 lock discipline at every UI-thread detector->* call-site.
     if (isTraining && trainingSampleCount >= MIN_TRAINING_SAMPLES * 3) {
         if (detector) {
-            bool success = detector->finishTraining();
+            bool success;
+            {
+                std::lock_guard<std::mutex> lock(audioMutex);
+                success = detector->finishTraining();
+            }
             isTraining = false;
             if (success) {
                 hasProfile = true;
-                if (configManager) detector->saveTrainingData(configManager->getTrainingDataPath());
+                if (configManager) {
+                    std::lock_guard<std::mutex> lock(audioMutex);
+                    detector->saveTrainingData(configManager->getTrainingDataPath());
+                }
             }
         }
     }
-    
+
     if (isTraining) {
         if (ImGui::Button("Stop Training", ImVec2(120, 30))) {
             if (detector) {
-                bool success = detector->finishTraining();
+                bool success;
+                {
+                    std::lock_guard<std::mutex> lock(audioMutex);
+                    success = detector->finishTraining();
+                }
                 if (success && configManager) {
-                    detector->saveTrainingData(configManager->getTrainingDataPath());
+                    {
+                        std::lock_guard<std::mutex> lock(audioMutex);
+                        detector->saveTrainingData(configManager->getTrainingDataPath());
+                    }
                     hasProfile = true;
                 }
             }
@@ -465,7 +654,12 @@ void MicMapApp::renderUI() {
         ImGui::TextColored(ImVec4(1,0.5f,0,1), "Cover mic now! (%d samples)", trainingSampleCount.load());
     } else {
         if (ImGui::Button("Train Pattern", ImVec2(120, 30)) && detector) {
-            detector->startTraining();
+            // WR-07: startTraining resets the detector's training-sample
+            // accumulator; must be serialized with the audio callback.
+            {
+                std::lock_guard<std::mutex> lock(audioMutex);
+                detector->startTraining();
+            }
             isTraining = true;
             trainingSampleCount = 0;
         }
@@ -473,6 +667,12 @@ void MicMapApp::renderUI() {
         if (ImGui::Button("Clear", ImVec2(60, 30)) && detector) {
             auto dev = audioCapture->getCurrentDevice();
             if (dev.sampleRate > 0) {
+                // WR-03: detector reassignment must be serialized with the
+                // WASAPI callback. Without this lock the callback can be
+                // mid-`detector->analyze(...)` when the unique_ptr reset
+                // destroys the old detector, which is a classic data race
+                // on a non-atomic unique_ptr.
+                std::lock_guard<std::mutex> lock(audioMutex);
                 detector = detection::createFFTDetector(dev.sampleRate);
                 detector->setMinDetectionDuration(detectionTimeMs);
             }
@@ -480,43 +680,51 @@ void MicMapApp::renderUI() {
             trainingSampleCount = 0;
         }
     }
-    
+
     // Training status (matching mic_test)
     if (hasProfile) {
         ImGui::TextColored(ImVec4(0,1,0,1), "Status: Profile trained and ready");
     } else {
         ImGui::TextColored(ImVec4(1,0.5f,0,1), "Status: No profile loaded");
     }
-    
+
     ImGui::Spacing();
     ImGui::Text("Audio Levels");
     ImGui::Separator();
-    
+
     // Input level with dB display (matching mic_test)
     ImGui::Text("Input Level: %.1f dB", currentLevelDb.load());
     ImGui::ProgressBar(currentLevel.load(), ImVec2(-1, 18));
-    
+
     // Confidence meter (matching mic_test)
     ImGui::Text("Confidence: %.0f%%", currentConfidence.load() * 100.0f);
     float conf = currentConfidence.load();
     if (isDetected.load()) ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(1,0.55f,0,1));
     ImGui::ProgressBar(conf, ImVec2(-1, 18));
     if (isDetected.load()) ImGui::PopStyleColor();
-    
+
     // Spectral flatness and energy (matching mic_test)
     ImGui::Text("Spectral Flatness: %.3f", currentSpectralFlatness.load());
     ImGui::Text("Energy: %.1f dB", currentEnergyDb.load());
-    
+
     ImGui::Spacing();
-    
+
     // Detection indicator (matching mic_test style)
     bool buttonFire = buttonWouldFire.load();
     bool detected = isDetected.load();
-    
+
+    // IN-08: detectionBuf was declared unconditionally at outer scope even
+    // though only the `detected` branch needs a formatted string; the
+    // "TRIGGERED" / "NOT DETECTED" branches use string literals. Keeping the
+    // buffer at outer scope here (rather than inside the branch) is REQUIRED
+    // because `detectionText` is a `const char*` that must remain valid until
+    // the ImGui::Button call below — moving the buffer into the branch would
+    // dangle the pointer. We now populate the buffer only when needed and
+    // document the lifetime so future refactors don't regress.
     ImVec4 boxColor;
     const char* detectionText;
-    char detectionBuf[128];
-    
+    char detectionBuf[128];  // lifetime: must outlive ImGui::Button(detectionText, ...) below
+
     if (buttonFire) {
         boxColor = ImVec4(0, 0.78f, 0, 1);  // Green - triggered
         detectionText = "TRIGGERED";
@@ -529,7 +737,7 @@ void MicMapApp::renderUI() {
         boxColor = ImVec4(0.24f, 0.24f, 0.24f, 1);  // Dark gray - not detected
         detectionText = "NOT DETECTED";
     }
-    
+
     // Draw detection box
     ImGui::PushStyleColor(ImGuiCol_Button, boxColor);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, boxColor);
@@ -573,55 +781,209 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_CLOSE: ShowWindow(hWnd, SW_HIDE); g_app.minimizedToTray = true; return 0;
         case WM_DESTROY: PostQuitMessage(0); return 0;
     }
-    return DefWindowProc(hWnd, msg, wParam, lParam);
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow) {
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR /*lpCmdLine-unused*/, int nCmdShow) {
+    // Phase 3 D-01: parse CLI flags FIRST, before anything else. Use the
+    // wide-char argv from CommandLineToArgvW (Pitfall 8: free it the moment
+    // CliFlags is populated — no argv pointers stored).
+    int argc = 0;
+    LPWSTR* argvW = CommandLineToArgvW(GetCommandLineW(), &argc);
+    micmap::common::CliFlags flags = micmap::common::parseCliArgs(argc, argvW);
+    if (argvW) { LocalFree(argvW); argvW = nullptr; }
+    // argvW is now INVALID; use only `flags` below.
+
+    // D-02 / D-03 / D-04: CLI fork — headless register/unregister BEFORE
+    // any GUI init (no RegisterClassExW, no CreateWindowW, no D3D, no
+    // ImGui). D-04: no console allocation — the default ConsoleLogger's
+    // stdout writes are dropped on the floor in headless CLI mode; exit
+    // code carries the result (0 success, 1 failure).
+    if (flags.registerManifest || flags.unregisterManifest) {
+#ifdef MICMAP_HAS_OPENVR
+        vr::EVRInitError initErr = vr::VRInitError_None;
+        vr::VR_Init(&initErr, vr::VRApplication_Utility);
+        if (initErr != vr::VRInitError_None) {
+            MICMAP_LOG_ERROR("CLI VR_Init(Utility) failed: ",
+                             vr::VR_GetVRInitErrorAsEnglishDescription(initErr));
+            return 1;  // D-03
+        }
+        auto registrar = micmap::steamvr::createManifestRegistrar();
+        micmap::steamvr::RegisterResult r = flags.registerManifest
+            ? registrar->registerApp()
+            : registrar->unregisterApp();
+        vr::VR_Shutdown();
+        return (r == micmap::steamvr::RegisterResult::Success) ? 0 : 1;
+#else
+        MICMAP_LOG_ERROR("OpenVR not available in this build; cannot register manifest");
+        return 1;
+#endif
+    }
+
+    // Phase 4 INST-08 / D-09 / D-12: --patch-bindings / --unpatch-bindings
+    // CLI fork. MUST run BEFORE the single-instance mutex below so an
+    // installer invocation does not contend with a live GUI instance.
+    // No VR_Init: patcher resolves SteamVR config dir internally via
+    // openvrpaths.vrpath parse; we only need file-system access, not a
+    // running vrserver. Exit-code contract per Phase 3 D-03: 0 = success,
+    // 1 = failure (inspected by Inno Setup [Run] Check: clauses).
+    if (flags.patchBindings || flags.unpatchBindings) {
+        auto appLogSink = [](const char* msg) {
+            MICMAP_LOG_INFO(msg);
+        };
+        namespace fs = std::filesystem;
+        fs::path configDir = micmap::bindings::ResolveSteamVrConfigDir(appLogSink);
+        if (configDir.empty()) {
+            MICMAP_LOG_ERROR("Could not resolve SteamVR config dir from openvrpaths.vrpath");
+            return 1;
+        }
+        bool ok;
+        if (flags.patchBindings) {
+            ok = micmap::bindings::PatchGenericHmdBindingsFile(configDir, appLogSink)
+              && micmap::bindings::EnsureControllerTypeFiles(configDir, "lighthouse_hmd", appLogSink);
+        } else {
+            ok = micmap::bindings::UnpatchGenericHmdBindings(appLogSink);
+        }
+        return ok ? 0 : 1;
+    }
+
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"MicMapSingleInstance");
+    // IN-08: CreateMutexW can return NULL on failure (rare — security
+    // descriptor errors, kernel object exhaustion). If it did, hMutex is
+    // NULL, GetLastError() will not be ERROR_ALREADY_EXISTS (so the
+    // single-instance gate below falls through), and we would boot a second
+    // instance without a guard. Bail explicitly.
+    if (!hMutex) {
+        MICMAP_LOG_ERROR("CreateMutexW failed: ", GetLastError());
+        return 1;
+    }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND w = FindWindowW(L"MicMapMain", nullptr);
-        if (w) { ShowWindow(w, SW_SHOW); SetForegroundWindow(w); }
+        // D-08: --minimized second instance = SteamVR re-launching while the
+        // first instance is already alive. Silent exit; do NOT steal focus.
+        if (!flags.minimized) {
+            HWND w = FindWindowW(L"MicMapMain", nullptr);
+            if (w) { PostMessageW(w, WM_COMMAND, IDM_SHOW, 0); SetForegroundWindow(w); }
+        }
+        // WR-02: CreateMutexW returns a valid handle even on
+        // ERROR_ALREADY_EXISTS; every other exit path in WinMain closes it,
+        // so close it here too for consistency (handle is benign at process
+        // scope, but leaking it here is a footgun relative to every sibling
+        // exit path).
+        CloseHandle(hMutex);
         return 0;
     }
-    
+
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WindowProc, 0, 0, hInstance, LoadIcon(nullptr, IDI_APPLICATION), LoadCursor(nullptr, IDC_ARROW), nullptr, nullptr, L"MicMapMain", nullptr };
     RegisterClassExW(&wc);
     g_app.hwnd = CreateWindowW(L"MicMapMain", L"MicMap", WS_OVERLAPPEDWINDOW, 100, 100, 500, 620, nullptr, nullptr, hInstance, nullptr);
-    
-    if (!CreateDeviceD3D(g_app.hwnd)) { CleanupDeviceD3D(); UnregisterClassW(wc.lpszClassName, wc.hInstance); return 1; }
-    
+
+    // WR-04: CreateWindowW can fail (rare — typically GDI object exhaustion
+    // or high-DPI quirks on locked-down systems). If hwnd is null, the
+    // D3D11CreateDeviceAndSwapChain below would receive OutputWindow=nullptr,
+    // which is UB on older Windows builds. Bail out cleanly and release the
+    // initial-owner mutex so the next launch is not stuck seeing
+    // ERROR_ALREADY_EXISTS during crash-restart cycles.
+    if (!g_app.hwnd) {
+        MICMAP_LOG_ERROR("CreateWindowW failed: ", GetLastError());
+        UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        CloseHandle(hMutex);
+        return 1;
+    }
+
+    // WR-04: on D3D init failure also destroy the window and close the
+    // single-instance mutex — the original code only unregistered the
+    // window class and relied on OS process-exit cleanup for the rest.
+    if (!CreateDeviceD3D(g_app.hwnd)) {
+        CleanupDeviceD3D();
+        DestroyWindow(g_app.hwnd);
+        UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        CloseHandle(hMutex);
+        return 1;
+    }
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
     ImGui_ImplWin32_Init(g_app.hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
-    
-    g_app.initialize();
+
+    // WR-03: fail-closed on initialize() failure. If audio capture couldn't
+    // be created the app has no way to detect; proceeding would (a) still
+    // register the manifest via the retry thread, causing SteamVR to
+    // auto-launch a broken instance on next boot, and (b) leak a tray icon
+    // / window / mutex into a zombie process. Tear everything down cleanly
+    // and propagate the failure as exit code 1 to WinMain's caller.
+    if (!g_app.initialize()) {
+        MICMAP_LOG_ERROR("MicMapApp::initialize failed; exiting");
+        ImGui_ImplDX11_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        CleanupDeviceD3D();
+        DestroyWindow(g_app.hwnd);
+        UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        CloseHandle(hMutex);
+        return 1;
+    }
     SetupSystemTray(g_app.hwnd);
-    
-    // Start async initialization of VR and driver
-    std::thread initThread([]() {
+
+    // Start async initialization of VR and driver.
+    // WR-01: tracked on g_app (not detached) so shutdown() can join before
+    // step 3 (driverClient->disconnect). The cancel flag short-circuits the
+    // remaining work if the user quits during first-boot init.
+    //
+    // WR-08: seed driverConnectFuture / vrInitFuture from the initial thread's
+    // packaged_task futures so the main-loop reconnect guard (which checks
+    // `driverConnectFuture.valid() && wait_for(0) != ready`) naturally
+    // serializes against the initial thread's in-flight
+    // driverClient->connect() / vrInput->initialize() calls. Without this
+    // seeding, the main loop's reconnect branch would fire ~2s into boot
+    // while the initial thread's connect() was still running, launching a
+    // *second* concurrent connect() on the same IDriverClient instance.
+    std::packaged_task<void()> connectTask([]() {
+        if (g_app.initialConnectCancel.load()) return;
         if (g_app.driverClient) {
             g_app.driverClient->connect();
         }
+    });
+    std::packaged_task<void()> vrInitTask([]() {
+        if (g_app.initialConnectCancel.load()) return;
         if (g_app.vrInput) {
             g_app.vrInput->initialize();
-            // Initialize dashboard manager once VR is connected
-            if (g_app.vrInput->isInitialized() && g_app.dashboardManager) {
-                auto sharedVR = std::shared_ptr<steamvr::IVRInput>(steamvr::createOpenVRInput().release());
-                sharedVR->initialize();
-                steamvr::DashboardManagerConfig dashConfig;
-                dashConfig.autoReconnect = true;
-                dashConfig.exitWithSteamVR = false;
-                g_app.dashboardManager->initialize(sharedVR, dashConfig);
-            }
         }
     });
-    initThread.detach();
-    
-    bool startMin = lpCmdLine && strstr(lpCmdLine, "--minimized");
-    if (startMin) { g_app.minimizedToTray = true; } else { ShowWindow(g_app.hwnd, nCmdShow); UpdateWindow(g_app.hwnd); }
-    
+    g_app.driverConnectFuture = connectTask.get_future();
+    g_app.vrInitFuture = vrInitTask.get_future();
+    // IN-11 iter-3: invoke both packaged_tasks unconditionally so their
+    // futures always resolve to a valid void() rather than broken_promise.
+    // Each task body already short-circuits on initialConnectCancel (lines
+    // 925-929, 931-935), so the fast-cancel intent is preserved without
+    // leaving the main-loop reconnect guard looking at broken-promise futures.
+    g_app.initialConnectThread = std::thread(
+        [connectTask = std::move(connectTask),
+         vrInitTask  = std::move(vrInitTask)]() mutable {
+            connectTask();
+            vrInitTask();
+        });
+
+    // D-06: silent-mode window policy — never ShowWindow when auto-launched
+    // by SteamVR. The legacy command-line substring check on lpCmdLine has
+    // been replaced by flags.minimized parsed at WinMain entry.
+    if (flags.minimized) {
+        g_app.minimizedToTray = true;
+    } else {
+        ShowWindow(g_app.hwnd, nCmdShow);
+        UpdateWindow(g_app.hwnd);
+    }
+
+    // D-09: first-silent-launch balloon — fires once per install, persisted
+    // via AppConfig.shownTrayNotification. Gated on flags.minimized so a
+    // user-clicked boot never consumes the one-shot.
+    if (flags.minimized && g_app.configManager) {
+        micmap::apps::ProductionShellNotifySeam shellAdapter(g_app.nid);
+        micmap::apps::fireBalloonIfFirstSilentLaunch(
+            shellAdapter, *g_app.configManager, flags.minimized);
+    }
+
     ImVec4 clear_color(0.1f, 0.1f, 0.1f, 1.0f);
     while (g_app.running) {
         MSG msg;
@@ -631,54 +993,42 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
             if (msg.message == WM_QUIT) g_app.running = false;
         }
         if (!g_app.running) break;
-        
+
         // Non-blocking updates - only poll if initialized
         if (g_app.vrInput && g_app.vrInput->isInitialized()) {
             g_app.vrInput->pollEvents();
         }
-        if (g_app.dashboardManager && g_app.dashboardManager->isConnected()) {
-            g_app.dashboardManager->update();
-        }
-        
-        // Async reconnection attempts using futures to avoid blocking
-        static std::future<void> driverConnectFuture;
-        static std::future<void> vrInitFuture;
+
+        // Async reconnection attempts using futures to avoid blocking.
+        // WR-05: futures live on g_app (see MicMapApp::driverConnectFuture /
+        // vrInitFuture) so shutdown() can wait on them before teardown.
         static int reconnectCounter = 0;
         int reconnectInterval = g_app.minimizedToTray ? 100 : 40;
-        
+
         if (++reconnectCounter >= reconnectInterval) {
             reconnectCounter = 0;
-            
+
             // Check if driver needs reconnection (async)
             if (g_app.driverClient && !g_app.driverClient->isConnected()) {
-                if (!driverConnectFuture.valid() ||
-                    driverConnectFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-                    driverConnectFuture = std::async(std::launch::async, []() {
+                if (!g_app.driverConnectFuture.valid() ||
+                    g_app.driverConnectFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+                    g_app.driverConnectFuture = std::async(std::launch::async, []() {
                         g_app.driverClient->connect();
                     });
                 }
             }
-            
+
             // Check if VR needs initialization (async)
             if (g_app.vrInput && !g_app.vrInput->isInitialized()) {
-                if (!vrInitFuture.valid() ||
-                    vrInitFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-                    vrInitFuture = std::async(std::launch::async, []() {
+                if (!g_app.vrInitFuture.valid() ||
+                    g_app.vrInitFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+                    g_app.vrInitFuture = std::async(std::launch::async, []() {
                         g_app.vrInput->initialize();
-                        // Initialize dashboard manager once VR is connected
-                        if (g_app.vrInput->isInitialized() && g_app.dashboardManager && !g_app.dashboardManager->isConnected()) {
-                            auto sharedVR = std::shared_ptr<steamvr::IVRInput>(steamvr::createOpenVRInput().release());
-                            sharedVR->initialize();
-                            steamvr::DashboardManagerConfig dashConfig;
-                            dashConfig.autoReconnect = true;
-                            dashConfig.exitWithSteamVR = false;
-                            g_app.dashboardManager->initialize(sharedVR, dashConfig);
-                        }
                     });
                 }
             }
         }
-        
+
         if (!g_app.minimizedToTray) {
             ImGui_ImplDX11_NewFrame();
             ImGui_ImplWin32_NewFrame();
@@ -693,7 +1043,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int nCmdShow
             Sleep(50);
         }
     }
-    
+
     g_app.shutdown();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

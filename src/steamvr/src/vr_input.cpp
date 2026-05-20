@@ -2,23 +2,19 @@
  * @file vr_input.cpp
  * @brief VR input implementation using OpenVR SDK
  *
- * Implementation approach for dashboard interaction:
- *
- * 1. Dashboard closed: Use IVROverlay::ShowDashboard() to open the dashboard
- * 2. Dashboard open: Use the MicMap driver via HTTP to inject button events
- *    that simulate HMD button press, activating whatever is under the head-locked
- *    virtual pointer.
- *
- * The OpenVR approach was chosen over OpenXR because:
- * - OpenVR has direct access to IVROverlay for dashboard state queries
- * - OpenVR provides ShowDashboard() for opening the dashboard
- * - The MicMap driver can inject button events via IVRDriverInput
+ * This module connects to SteamVR as a background application for the sole
+ * purpose of monitoring Quit/SteamVRConnected/SteamVRDisconnected events.
+ * All button edges go through IDriverClient (POST /button) which the driver
+ * translates into /input/system/click edges on the HMD property container
+ * (Plan 01-03).
  */
 
 #include "micmap/steamvr/vr_input.hpp"
+#include "micmap/steamvr/vr_input_events.hpp"
 #include "micmap/common/logger.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <mutex>
 
 #ifdef MICMAP_HAS_OPENVR
@@ -62,53 +58,7 @@ public:
         // Stub always returns false - no real VR
         return false;
     }
-    
-    DashboardState getDashboardState() override {
-        return dashboardState_;
-    }
-    
-    bool sendHMDButtonEvent() override {
-        if (!initialized_) {
-            lastError_ = "Not initialized";
-            MICMAP_LOG_WARNING("Cannot send HMD button event: not initialized");
-            return false;
-        }
-        
-        MICMAP_LOG_INFO("Sending HMD button event (stub) - opening dashboard");
-        dashboardState_ = DashboardState::Open;
-        notifyEvent(VREventType::DashboardOpened);
-        return true;
-    }
-    
-    bool sendDashboardSelect() override {
-        if (!initialized_) {
-            lastError_ = "Not initialized";
-            MICMAP_LOG_WARNING("Cannot send dashboard select: not initialized");
-            return false;
-        }
-        
-        MICMAP_LOG_INFO("Sending dashboard select (stub) - HMD button press");
-        notifyEvent(VREventType::ButtonPressed);
-        notifyEvent(VREventType::ButtonReleased);
-        return true;
-    }
-    
-    bool performDashboardAction() override {
-        if (!initialized_) {
-            lastError_ = "Not initialized";
-            return false;
-        }
-        
-        auto state = getDashboardState();
-        if (state == DashboardState::Closed || state == DashboardState::Unknown) {
-            MICMAP_LOG_DEBUG("Dashboard closed - opening");
-            return sendHMDButtonEvent();
-        } else {
-            MICMAP_LOG_DEBUG("Dashboard open - sending select");
-            return sendDashboardSelect();
-        }
-    }
-    
+
     void pollEvents() override {
         // Stub implementation - no events to poll
     }
@@ -127,6 +77,12 @@ public:
     }
     
 protected:
+    // IN-07: intentional test injection seam. StubVRInput::pollEvents is a
+    // no-op (the stub has no SteamVR runtime to pull events from), so this
+    // method is unreachable from StubVRInput itself. Kept `protected` so
+    // test subclasses can inject synthetic VREvents (see
+    // tests/test_vr_input_quit_ordering.cpp for the parallel pattern on
+    // OpenVRInput's ack-before-notify path).
     void notifyEvent(VREventType type) {
         std::lock_guard<std::mutex> lock(callbackMutex_);
         if (eventCallback_) {
@@ -138,9 +94,8 @@ protected:
             eventCallback_(event);
         }
     }
-    
+
     bool initialized_ = false;
-    DashboardState dashboardState_ = DashboardState::Closed;
     std::string lastError_;
     VREventCallback eventCallback_;
     std::mutex callbackMutex_;
@@ -160,8 +115,8 @@ public:
         , startPort_(startPort)
         , endPort_(endPort)
     {
-        MICMAP_LOG_DEBUG("DriverClient created (host: {}, ports: {}-{})",
-                         host_, startPort_, endPort_);
+        MICMAP_LOG_DEBUG("DriverClient created (host: ", host_,
+                         ", ports: ", startPort_, "-", endPort_, ")");
     }
 
     ~DriverClient() override {
@@ -177,7 +132,7 @@ public:
 
         // Try each port in the range
         for (int port = startPort_; port <= endPort_; ++port) {
-            MICMAP_LOG_DEBUG("Trying port {}...", port);
+            MICMAP_LOG_DEBUG("Trying port ", port, "...");
             
             httplib::Client client(host_, port);
             client.set_connection_timeout(1);  // 1 second timeout
@@ -188,7 +143,7 @@ public:
             if (res && res->status == 200) {
                 port_ = port;
                 connected_ = true;
-                MICMAP_LOG_INFO("Connected to MicMap driver on port {}", port_);
+                MICMAP_LOG_INFO("Connected to MicMap driver on port ", port_);
                 return true;
             }
         }
@@ -210,97 +165,35 @@ public:
         return connected_;
     }
 
-    bool click(const std::string& button, int durationMs) override {
+    bool tap() override {
         if (!ensureConnected()) {
+            lastError_ = "Not connected to driver";
+            MICMAP_LOG_ERROR("DriverClient::tap() failed: ", lastError_);
             return false;
         }
 
-        MICMAP_LOG_DEBUG("Sending click command (button: {}, duration: {}ms)",
-                         button, durationMs);
+        MICMAP_LOG_DEBUG("Sending tap (POST /button {\"kind\":\"tap\"})");
 
         httplib::Client client(host_, port_);
         client.set_connection_timeout(2);
         client.set_read_timeout(2);
 
-        std::string path = "/click?button=" + button + "&duration=" + std::to_string(durationMs);
-        auto res = client.Post(path);
+        auto res = client.Post("/button", R"({"kind":"tap"})", "application/json");
 
         if (!res) {
             lastError_ = "HTTP request failed";
-            MICMAP_LOG_ERROR("Click command failed: {}", lastError_);
+            MICMAP_LOG_ERROR("DriverClient::tap() failed: ", lastError_);
             connected_ = false;  // Mark as disconnected to retry
             return false;
         }
 
         if (res->status != 200) {
             lastError_ = "Server returned status " + std::to_string(res->status);
-            MICMAP_LOG_ERROR("Click command failed: {}", lastError_);
+            MICMAP_LOG_ERROR("DriverClient::tap() failed: ", lastError_);
             return false;
         }
 
-        MICMAP_LOG_DEBUG("Click command successful");
-        return true;
-    }
-
-    bool press(const std::string& button) override {
-        if (!ensureConnected()) {
-            return false;
-        }
-
-        MICMAP_LOG_DEBUG("Sending press command (button: {})", button);
-
-        httplib::Client client(host_, port_);
-        client.set_connection_timeout(2);
-        client.set_read_timeout(2);
-
-        std::string path = "/press?button=" + button;
-        auto res = client.Post(path);
-
-        if (!res) {
-            lastError_ = "HTTP request failed";
-            MICMAP_LOG_ERROR("Press command failed: {}", lastError_);
-            connected_ = false;
-            return false;
-        }
-
-        if (res->status != 200) {
-            lastError_ = "Server returned status " + std::to_string(res->status);
-            MICMAP_LOG_ERROR("Press command failed: {}", lastError_);
-            return false;
-        }
-
-        MICMAP_LOG_DEBUG("Press command successful");
-        return true;
-    }
-
-    bool release(const std::string& button) override {
-        if (!ensureConnected()) {
-            return false;
-        }
-
-        MICMAP_LOG_DEBUG("Sending release command (button: {})", button);
-
-        httplib::Client client(host_, port_);
-        client.set_connection_timeout(2);
-        client.set_read_timeout(2);
-
-        std::string path = "/release?button=" + button;
-        auto res = client.Post(path);
-
-        if (!res) {
-            lastError_ = "HTTP request failed";
-            MICMAP_LOG_ERROR("Release command failed: {}", lastError_);
-            connected_ = false;
-            return false;
-        }
-
-        if (res->status != 200) {
-            lastError_ = "Server returned status " + std::to_string(res->status);
-            MICMAP_LOG_ERROR("Release command failed: {}", lastError_);
-            return false;
-        }
-
-        MICMAP_LOG_DEBUG("Release command successful");
+        MICMAP_LOG_DEBUG("DriverClient::tap() successful");
         return true;
     }
 
@@ -356,12 +249,13 @@ private:
 
 /**
  * @brief OpenVR-based VR input implementation
- * 
+ *
  * Uses OpenVR SDK for:
- * - Connecting to SteamVR as a background application
- * - Querying dashboard visibility via IVROverlay
- * - Opening dashboard via ShowDashboard()
- * - Simulating HMD button press for dashboard selection
+ * - Connecting to SteamVR as a background application (VRApplication_Background)
+ * - Polling lifecycle events (SteamVR quit, connection, etc.)
+ *
+ * Does NOT handle button presses — those flow through IDriverClient to the
+ * MicMap driver which owns /input/system/click on the HMD container.
  */
 class OpenVRInput : public IVRInput {
 public:
@@ -406,16 +300,6 @@ public:
             return false;
         }
         
-        // Get overlay interface for dashboard queries
-        vrOverlay_ = vr::VROverlay();
-        if (!vrOverlay_) {
-            lastError_ = "Failed to get IVROverlay interface";
-            MICMAP_LOG_ERROR(lastError_);
-            vr::VR_Shutdown();
-            vrSystem_ = nullptr;
-            return false;
-        }
-        
         initialized_ = true;
         MICMAP_LOG_INFO("OpenVR initialized successfully");
         
@@ -431,8 +315,7 @@ public:
         }
         
         MICMAP_LOG_INFO("Shutting down OpenVR input");
-        
-        vrOverlay_ = nullptr;
+
         vrSystem_ = nullptr;
         
         vr::VR_Shutdown();
@@ -450,89 +333,7 @@ public:
         // Check if SteamVR is running
         return vr::VR_IsRuntimeInstalled() && vr::VR_IsHmdPresent();
     }
-    
-    DashboardState getDashboardState() override {
-        if (!initialized_ || !vrOverlay_) {
-            return DashboardState::Unknown;
-        }
-        
-        // Query dashboard visibility
-        bool isVisible = vrOverlay_->IsDashboardVisible();
-        return isVisible ? DashboardState::Open : DashboardState::Closed;
-    }
-    
-    bool sendHMDButtonEvent() override {
-        if (!initialized_ || !vrOverlay_) {
-            lastError_ = "Not initialized";
-            MICMAP_LOG_WARNING("Cannot send HMD button event: not initialized");
-            return false;
-        }
-        
-        MICMAP_LOG_INFO("Opening SteamVR dashboard");
-        
-        // Use ShowDashboard to open the dashboard
-        // The empty string opens the main dashboard
-        // Note: ShowDashboard returns void in OpenVR API
-        vrOverlay_->ShowDashboard("");
-        
-        notifyEvent(VREventType::DashboardOpened);
-        return true;
-    }
-    
-    bool sendDashboardSelect() override {
-        if (!initialized_ || !vrSystem_) {
-            lastError_ = "Not initialized";
-            MICMAP_LOG_WARNING("Cannot send dashboard select: not initialized");
-            return false;
-        }
-        
-        MICMAP_LOG_INFO("Sending HMD button press for dashboard selection via driver");
-        
-        // Use the MicMap driver to inject a button event
-        // This is the proper way to inject button events in OpenVR
-        if (!driverClient_) {
-            driverClient_ = createDriverClient();
-        }
-        
-        if (!driverClient_->isConnected()) {
-            if (!driverClient_->connect()) {
-                lastError_ = "Failed to connect to MicMap driver: " + driverClient_->getLastError();
-                MICMAP_LOG_WARNING(lastError_);
-                MICMAP_LOG_WARNING("Make sure the MicMap driver is installed and SteamVR is running");
-                return false;
-            }
-        }
-        
-        // Send click command to the driver - use trigger for laser mouse selection
-        if (!driverClient_->click("trigger", 100)) {
-            lastError_ = "Failed to send click command: " + driverClient_->getLastError();
-            MICMAP_LOG_ERROR(lastError_);
-            return false;
-        }
-        
-        notifyEvent(VREventType::ButtonPressed);
-        notifyEvent(VREventType::ButtonReleased);
-        
-        MICMAP_LOG_INFO("Dashboard select sent successfully via driver");
-        return true;
-    }
-    
-    bool performDashboardAction() override {
-        if (!initialized_) {
-            lastError_ = "Not initialized";
-            return false;
-        }
-        
-        auto state = getDashboardState();
-        if (state == DashboardState::Closed || state == DashboardState::Unknown) {
-            MICMAP_LOG_DEBUG("Dashboard closed - opening");
-            return sendHMDButtonEvent();
-        } else {
-            MICMAP_LOG_DEBUG("Dashboard open - sending select");
-            return sendDashboardSelect();
-        }
-    }
-    
+
     void pollEvents() override {
         if (!initialized_ || !vrSystem_) {
             return;
@@ -558,37 +359,43 @@ public:
     }
     
 private:
-    void processVREvent(const vr::VREvent_t& event) {
-        switch (event.eventType) {
-            case vr::VREvent_Quit:
-                MICMAP_LOG_INFO("SteamVR quit event received");
-                notifyEvent(VREventType::Quit);
-                break;
-                
-            case vr::VREvent_DashboardActivated:
-                MICMAP_LOG_DEBUG("Dashboard activated");
-                notifyEvent(VREventType::DashboardOpened);
-                break;
-                
-            case vr::VREvent_DashboardDeactivated:
-                MICMAP_LOG_DEBUG("Dashboard deactivated");
-                notifyEvent(VREventType::DashboardClosed);
-                break;
-                
-            case vr::VREvent_ButtonPress:
-                notifyEvent(VREventType::ButtonPressed);
-                break;
-                
-            case vr::VREvent_ButtonUnpress:
-                notifyEvent(VREventType::ButtonReleased);
-                break;
-                
-            default:
-                // Ignore other events
-                break;
+    // Adapters that let OpenVRInput::processVREvent delegate to the free
+    // processVREventImpl(IVRSystemSeam&, IEventSink&, uint32_t) without
+    // leaking OpenVR surface into the test-only seam header.
+    //
+    // Defined as nested private classes so EventSinkAdapter has access to
+    // OpenVRInput::notifyEvent without a friend declaration.
+    class VRSystemAdapter : public IVRSystemSeam {
+    public:
+        explicit VRSystemAdapter(vr::IVRSystem* sys) : sys_(sys) {}
+        void AcknowledgeQuit_Exiting() override {
+            // D-11 / Pitfall 2 / OpenVR #1425: this is THE call that
+            // stops Valve's 2-second quit watchdog. Called BEFORE the
+            // app-level notifyEvent callback in processVREventImpl.
+            if (sys_) sys_->AcknowledgeQuit_Exiting();
         }
+    private:
+        vr::IVRSystem* sys_;
+    };
+
+    class EventSinkAdapter : public IEventSink {
+    public:
+        explicit EventSinkAdapter(OpenVRInput& self) : self_(self) {}
+        void notifyEvent(VREventType t) override { self_.notifyEvent(t); }
+    private:
+        OpenVRInput& self_;
+    };
+
+    void processVREvent(const vr::VREvent_t& event) {
+        // Delegate to the testable free function so production and unit
+        // tests share the same ack-before-notify ordering logic.
+        // See src/steamvr/include/micmap/steamvr/vr_input_events.hpp.
+        VRSystemAdapter  sysAdapter(vrSystem_);
+        EventSinkAdapter sinkAdapter(*this);
+        processVREventImpl(sysAdapter, sinkAdapter,
+                           static_cast<uint32_t>(event.eventType));
     }
-    
+
     void notifyEvent(VREventType type) {
         std::lock_guard<std::mutex> lock(callbackMutex_);
         if (eventCallback_) {
@@ -603,11 +410,9 @@ private:
     
     bool initialized_ = false;
     vr::IVRSystem* vrSystem_ = nullptr;
-    vr::IVROverlay* vrOverlay_ = nullptr;
     std::string lastError_;
     VREventCallback eventCallback_;
     std::mutex callbackMutex_;
-    std::unique_ptr<IDriverClient> driverClient_;
 };
 
 #endif // MICMAP_HAS_OPENVR

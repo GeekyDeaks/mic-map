@@ -11,7 +11,8 @@
 
 add_library(micmap_steamvr STATIC
     src/vr_input.cpp
-    src/dashboard_manager.cpp
+    src/vr_input_events.cpp
+    src/manifest_registrar.cpp
 )
 
 target_include_directories(micmap_steamvr
@@ -27,13 +28,27 @@ target_link_libraries(micmap_steamvr
         httplib::httplib
 )
 
+# Pathcch.lib (Windows SDK): required by manifest_registrar.cpp's
+# resolveManifestAbsolutePath() for PathCchRemoveFileSpec. Built into the
+# Windows SDK since Vista; naked target name resolves via the MSVC default
+# link-library search path.
+if(WIN32)
+    target_link_libraries(micmap_steamvr PRIVATE Pathcch)
+endif()
+
 target_compile_features(micmap_steamvr PUBLIC cxx_std_17)
 
 # OpenVR SDK - Required for full SteamVR integration
 # If not found, the library will use a stub implementation
+#
+# Linkage is PUBLIC because manifest_registrar.hpp exposes vr::EVRApplicationError
+# in the IVRApplicationsSurface seam (so test doubles can override the methods
+# with their native OpenVR return types). Consumers transitively get the OpenVR
+# include dirs — and, being a STATIC lib, this is a no-op at link time for
+# implementations that don't actually reference OpenVR symbols.
 if(TARGET OpenVR::openvr_api)
-    target_link_libraries(micmap_steamvr PRIVATE OpenVR::openvr_api)
-    target_compile_definitions(micmap_steamvr PRIVATE MICMAP_HAS_OPENVR)
+    target_link_libraries(micmap_steamvr PUBLIC OpenVR::openvr_api)
+    target_compile_definitions(micmap_steamvr PUBLIC MICMAP_HAS_OPENVR)
     message(STATUS "micmap_steamvr: OpenVR support enabled")
 else()
     message(STATUS "micmap_steamvr: OpenVR not found - using stub implementation")
@@ -65,18 +80,25 @@ if(WIN32 AND TARGET OpenVR::openvr_api)
         
         find_file(OPENVR_DLL
             NAMES ${OPENVR_DLL_NAME}
-            PATHS "${OPENVR_DIR}" "${OPENVR_DIR}/../bin/win64" "${OPENVR_DIR}/../bin/win32"
+            PATHS "${OPENVR_DIR}"
+                  "${OPENVR_DIR}/../../bin/win64"
+                  "${OPENVR_DIR}/../../bin/win32"
+                  "${OPENVR_DIR}/../bin/win64"
+                  "${OPENVR_DIR}/../bin/win32"
             NO_DEFAULT_PATH
         )
-        
+
         if(OPENVR_DLL)
             message(STATUS "Found OpenVR DLL: ${OPENVR_DLL}")
-            # Copy DLL to output directory after build
+            # Copy DLL to the runtime output directory (shared by all exes).
+            # Using CMAKE_RUNTIME_OUTPUT_DIRECTORY is correct because
+            # micmap_steamvr is a STATIC library — $<TARGET_FILE_DIR:micmap_steamvr>
+            # would resolve to the archive dir (build/lib/<cfg>), not build/bin/<cfg>.
             add_custom_command(TARGET micmap_steamvr POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${OPENVR_DLL}"
-                    "$<TARGET_FILE_DIR:micmap_steamvr>"
-                COMMENT "Copying OpenVR DLL to output directory"
+                    "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/"
+                COMMENT "Copying OpenVR DLL to runtime output directory"
             )
         endif()
     endif()

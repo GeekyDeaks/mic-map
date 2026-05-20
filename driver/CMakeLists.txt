@@ -1,15 +1,16 @@
 # driver/CMakeLists.txt
-# MicMap OpenVR Virtual Controller Driver
+# MicMap OpenVR HMD Sidecar Driver
 #
-# This driver registers a virtual controller with SteamVR that can inject
-# button events. The MicMap application communicates with this driver via
-# a local HTTP server to trigger dashboard selection.
+# This driver creates its own /input/system/click boolean component on the HMD
+# property container (no virtual controller, no tracked devices). The MicMap
+# application communicates with this driver via a local HTTP server (POST
+# /button) to toggle the SteamVR dashboard.
 
 cmake_minimum_required(VERSION 3.20)
 
 project(micmap_driver
     VERSION 0.1.0
-    DESCRIPTION "MicMap OpenVR Virtual Controller Driver"
+    DESCRIPTION "MicMap OpenVR HMD Sidecar Driver"
     LANGUAGES CXX
 )
 
@@ -22,9 +23,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(driver_micmap SHARED
     src/driver_main.cpp
     src/device_provider.cpp
-    src/virtual_controller.cpp
     src/http_server.cpp
-    src/process_launcher.cpp
 )
 
 # Include directories
@@ -52,6 +51,34 @@ if(TARGET httplib::httplib)
     )
 else()
     message(FATAL_ERROR "driver_micmap: cpp-httplib is required for the driver.")
+endif()
+
+# nlohmann/json for POST /button JSON parse (SVR-05 / SVR-08)
+if(TARGET nlohmann_json)
+    target_link_libraries(driver_micmap PRIVATE nlohmann_json)
+elseif(TARGET nlohmann_json::nlohmann_json)
+    target_link_libraries(driver_micmap PRIVATE nlohmann_json::nlohmann_json)
+else()
+    message(FATAL_ERROR "driver_micmap: nlohmann/json is required for POST /button body parse.")
+endif()
+
+# Phase 4 D-10: bindings_patcher was lifted to src/bindings/ so both
+# driver_micmap.dll and micmap.exe can share one source of truth. The driver
+# now links the shared lib + wraps DriverLog in a LogSink adapter (see
+# device_provider.cpp).
+target_link_libraries(driver_micmap PRIVATE micmap::bindings)
+
+# Version string used in SVR-10 init log line
+target_compile_definitions(driver_micmap PRIVATE
+    MICMAP_DRIVER_VERSION="${PROJECT_VERSION}"
+)
+
+# Warnings-as-errors -- enforces Pitfall 7 "unused code = dead code" check on the rip-out
+if(MSVC)
+    target_compile_options(driver_micmap PRIVATE /WX /W4)
+else()
+    target_compile_options(driver_micmap PRIVATE
+        -Werror -Wall -Wextra -Wunused-function -Wunused-variable)
 endif()
 
 # Platform-specific settings
@@ -103,45 +130,36 @@ add_custom_command(TARGET driver_micmap POST_BUILD
         "${CMAKE_BINARY_DIR}/driver/micmap/driver.vrdrivermanifest"
     COMMAND ${CMAKE_COMMAND} -E make_directory
         "${CMAKE_BINARY_DIR}/driver/micmap/resources/settings"
-    COMMAND ${CMAKE_COMMAND} -E make_directory
-        "${CMAKE_BINARY_DIR}/driver/micmap/resources/input"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/resources/driver.vrresources"
         "${CMAKE_BINARY_DIR}/driver/micmap/resources/driver.vrresources"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/resources/settings/default.vrsettings"
         "${CMAKE_BINARY_DIR}/driver/micmap/resources/settings/default.vrsettings"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/resources/input/micmap_controller_profile.json"
-        "${CMAKE_BINARY_DIR}/driver/micmap/resources/input/micmap_controller_profile.json"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/resources/input/vrcompositor_bindings_micmap_controller.json"
-        "${CMAKE_BINARY_DIR}/driver/micmap/resources/input/vrcompositor_bindings_micmap_controller.json"
     COMMENT "Copying driver resources to output directory"
 )
 
-# Installation rules for the driver
+# Installation rules for the driver.
+#
+# Phase 4 D-01: installer lands driver files at {SteamVR}\drivers\micmap\ -- so
+# the staged tree (cmake --install . --prefix build/stage) must match that
+# layout under drivers/ (plural) so installer/MicMap.iss [Files] can source
+# {#STAGE_DIR}\drivers\micmap\* verbatim. The dev-workflow POST_BUILD copies
+# above still emit to build/driver/micmap/** (singular) for local testing --
+# only the install destinations are plural.
 install(TARGETS driver_micmap
-    RUNTIME DESTINATION driver/micmap/bin/win64
-    LIBRARY DESTINATION driver/micmap/bin/win64
+    RUNTIME DESTINATION drivers/micmap/bin/win64
+    LIBRARY DESTINATION drivers/micmap/bin/win64
 )
 
 install(FILES driver.vrdrivermanifest
-    DESTINATION driver/micmap
+    DESTINATION drivers/micmap
 )
 
 install(FILES resources/driver.vrresources
-    DESTINATION driver/micmap/resources
+    DESTINATION drivers/micmap/resources
 )
 
 install(FILES resources/settings/default.vrsettings
-    DESTINATION driver/micmap/resources/settings
-)
-
-install(FILES resources/input/micmap_controller_profile.json
-    DESTINATION driver/micmap/resources/input
-)
-
-install(FILES resources/input/vrcompositor_bindings_micmap_controller.json
-    DESTINATION driver/micmap/resources/input
+    DESTINATION drivers/micmap/resources/settings
 )
